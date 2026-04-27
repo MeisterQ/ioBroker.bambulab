@@ -285,6 +285,1202 @@ class Bambulab extends utils.Adapter {
                     message.print.control.heatbreak_fan_speed = message.print.heatbreak_fan_speed;
                 }
 
+                // Normalize known X2D/H2D firmware type differences before jsonExplorer
+                // creates/writes the raw ioBroker states. This prevents repeated
+                // "State value ... has to be type ..." log messages when Bambu
+                // sends numeric IDs as numbers although older adapter state metadata
+                // defines the same key name as string elsewhere.
+                this.normalizeBambuFirmwareTypes(message.print);
+
+                // Create stable, user-friendly datapoints for dual-nozzle printers (H2D/X2D).
+                // The original raw Bambu MQTT structure below print.device.* is still
+                // created by jsonExplorer, but known type conflicts are normalized above.
+                this.normalizeDualNozzlePrinterData(message.print);
+
+                // Store original stg_cur value for printer state checking before conversion
+                const originalStgCur = message.print.stg_cur;
+
+                // Update current printing state for safety checks
+                currentPrintingState = originalStgCur;
+
+                if (message.print.stg_cur != null) {
+                    message.print.stg_cur = convert.stageParser(message.print.stg_cur);
+                    message.print.control.stg_cur = convert.stageParser(message.print.stg_cur);
+                }
+                if (message.print.big_fan1_speed != null) {
+                    message.print.big_fan1_speed = convert.fanSpeed(message.print.big_fan1_speed);
+                    message.print.control.big_fan1_speed = message.print.big_fan1_speed;
+                }
+                if (message.print.big_fan2_speed != null) {
+                    message.print.big_fan2_speed = convert.fanSpeed(message.print.big_fan2_speed);
+                    message.print.control.big_fan2_speed = message.print.big_fan2_speed;
+                }
+                if (message.print.spd_lvl != null) {
+                    message.print.control.spd_lvl = message.print.spd_lvl;
+                }
+                if (message.print.bed_target_temper != null) {
+                    message.print.control.bed_target_temper = message.print.bed_target_temper;
+                }
+                if (message.print.nozzle_target_temper != null) {
+                    message.print.control.nozzle_target_temper = message.print.nozzle_target_temper;
+                }
+                if (message.print.mc_remaining_time != null) {
+                    // Only calculate finish time when printer is actively printing (not idle/offline)
+                    // stg_cur values:
+                    //   -2 = Offline
+                    //   -1 = Idle
+                    //    0 = Preparing
+                    //    1 = Printing
+                    //    2 = Paused
+                    //    3 = Completed
+                    //    4+ = Other working states (update as needed)
+                    if (originalStgCur != null && originalStgCur >= 0) {
+                        message.print.finishTime = new Date(
+                            new Date().getTime() + message.print.mc_remaining_time * 60000,
+                        ).toISOString();
+                    } else {
+                        // Clear finish time when printer is idle/offline to avoid stale data
+                        message.print.finishTime = '';
+                    }
+                    message.print.mc_remaining_time = convert.remainingTime(message.print.mc_remaining_time);
+                }
+
+                if (message.print.gcode_start_time != null) {
+                    let gcode_start_timeFormatted = new Date(message.print.gcode_start_time * 1000).toString();
+                    gcode_start_timeFormatted = gcode_start_timeFormatted.replace('"', '');
+                    message.print.gcode_start_timeFormatted = gcode_start_timeFormatted;
+                }
+                if (message.print.vt_tray != null && message.print.vt_tray.bed_temp != null) {
+                    message.print.vt_tray.bed_temp = +message.print.vt_tray.bed_temp;
+                }
+                // Update light control datapoint
+                if (
+                    message.print.lights_report &&
+                    message.print.lights_report[0] &&
+                    message.print.lights_report[0].mode === 'on'
+                ) {
+                    message.print.control.lightChamber = true;
+                    message.print.lights_report[0].mode = true;
+                } else if (
+                    message.print.lights_report &&
+                    message.print.lights_report[0] &&
+                    message.print.lights_report[0].mode === 'off'
+                ) {
+                    message.print.control.lightChamber = false;
+                    message.print.lights_report[0].mode = false;
+                }
+
+                // Translate HMS Code & write to state
+                const hmsError = [];
+                if (message.print.hms != null) {
+                    message.print.hms.hmsErrors = true;
+                    for (const hms_code in message.print.hms) {
+                        const attr = convert.DecimalHexTwosComplement(message.print.hms[hms_code].attr);
+                        const code = convert.DecimalHexTwosComplement(message.print.hms[hms_code].code);
+
+                        let full_code = (attr + code).replace(/(.{4})/g, '$1_');
+                        full_code = full_code.substring(0, full_code.length - 1);
+                        const urlEN = `https://wiki.bambulab.com/en/x1/troubleshooting/hmscode/${full_code}`;
+
+                        let errorDesc = 'No description available in your language';
+                        if (
+                            errorCodesHMS[full_code.replaceAll('_', '').toUpperCase()] != null &&
+                            errorCodesHMS[full_code.replaceAll('_', '').toUpperCase()]['desc'] != null
+                        ) {
+                            errorDesc = errorCodesHMS[full_code.replaceAll('_', '').toUpperCase()]['desc'];
+                        }
+                        const errorMessageArray = { code: `HMS_${full_code}`, 'url-EN': urlEN, description: errorDesc };
+                        if (language.toUpperCase() !== 'EN') {
+                            errorMessageArray['url-local'] =
+                                `https://wiki.bambulab.com/${language}/x1/troubleshooting/hmscode/${full_code}`;
+                        }
+                        hmsError.push(errorMessageArray);
+                    }
+                } else {
+                    message.print.hms = {
+                        hmsErrorCount: 0,
+                        hmsErrors: false,
+                    };
+                }
+
+                await this.setState(`${this.config.serial}.hms.hmsErrorCode`, {
+                    val: JSON.stringify(hmsError),
+                    ack: true,
+                });
+
+                // For some reason library does not convert the ams related bed_temp to number when value = 0
+                if (
+                    message.print.ams != null &&
+                    message.print.ams.ams_exist_bits != null &&
+                    message.print.ams.ams_exist_bits === '1'
+                ) {
+                    // Call function to handle states for AMS unit
+                    message.print.ams.ams = this.handleAMSUnits(message);
+                }
+            }
+
+            // Translate home_flag to door state
+            if (message.print.home_flag === 14796168) {
+                message.print.doorOpen = true;
+            } else if (message.print.home_flag === 6407560) {
+                message.print.doorOpen = false;
+            }
+
+            // Explore JSON & create states
+            const returnJONexplorer = await jsonExplorer.traverseJson(
+                message.print,
+                this.config.serial,
+                false,
+                false,
+                0,
+            );
+            this.log.debug(`Response of JSONexploer: ${JSON.stringify(returnJONexplorer)}`);
+        } catch (e) {
+            this.log.error(`[messageHandler] ${e} | ${e.stack}`);
+        }
+        clientConnection.initiated = true;
+    }
+
+
+    /**
+     * Normalize known firmware type inconsistencies before handing the payload
+     * to iobroker-jsonexplorer.
+     *
+     * The jsonExplorer attribute table is keyed by the property name only. Some
+     * names are reused by Bambu in different branches with different types, e.g.
+     * plate.tar_id is a string while device.nozzle.tar_id is a numeric nozzle id.
+     * Converting only the conflicting raw firmware paths keeps old states stable
+     * and avoids changing the global state_attr definition for unrelated paths.
+     *
+     * @param {Record<string, any>} printData - The print object from MQTT
+     */
+    normalizeBambuFirmwareTypes(printData) {
+        if (!printData) {
+            return;
+        }
+
+        const toNumber = value => {
+            if (value === undefined || value === null || value === '') {
+                return value;
+            }
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? parsed : value;
+        };
+
+        const toString = value => {
+            if (value === undefined || value === null) {
+                return value;
+            }
+            return String(value);
+        };
+
+        // X2D/H2D: err2.err_code is sent as "0" but state_attr.err_code is numeric.
+        if (printData.err2?.err_code !== undefined) {
+            printData.err2.err_code = toNumber(printData.err2.err_code);
+        }
+
+        // X2D/H2D: device.nozzle.tar_id is a nozzle index (0/1), while other
+        // tar_id fields in the firmware are strings. Keep this raw state aligned
+        // with the existing global tar_id metadata to avoid log spam. Numeric
+        // versions are mirrored below as dual_nozzle.nozzle.target_id/x2d.nozzle.target_id.
+        if (printData.device?.nozzle?.tar_id !== undefined) {
+            printData.device.nozzle.tar_id = toString(printData.device.nozzle.tar_id);
+        }
+
+        // Same idea for src_id in case older objects were created as strings by
+        // jsonExplorer on some systems. The normalized active_id remains numeric.
+        if (printData.device?.nozzle?.src_id !== undefined) {
+            printData.device.nozzle.src_id = toString(printData.device.nozzle.src_id);
+        }
+    }
+
+    /**
+     * Create stable states for newer dual-nozzle Bambu Lab printers.
+     *
+     * X2D/H2D publish the relevant data mainly below print.device.*. The raw
+     * structure is useful but not very convenient in ioBroker because arrays
+     * like extruder.info[0]/[1] are not self-explanatory. This helper mirrors
+     * the most relevant fields into print.x2d.* and print.dual_nozzle.*.
+     *
+     * No write/control commands are added here intentionally. Tool-specific
+     * nozzle and chamber-heater commands should be verified on a real printer
+     * before exposing writable states.
+     *
+     * @param {Record<string, any>} printData - The print object from MQTT
+     */
+    normalizeDualNozzlePrinterData(printData) {
+        if (!printData || !printData.device) {
+            return;
+        }
+
+        const isDualNozzleModel =
+            this.config.printerModel === 'H2D-Series' ||
+            this.config.printerModel === 'X2D-Series' ||
+            Array.isArray(printData.device?.extruder?.info) ||
+            Array.isArray(printData.device?.nozzle?.info);
+
+        if (!isDualNozzleModel) {
+            return;
+        }
+
+        const toFiniteNumber = raw => {
+            if (raw == null || raw === '') {
+                return raw;
+            }
+            const val = Number(raw);
+            return Number.isFinite(val) ? val : raw;
+        };
+
+        const decodeTemp = raw => {
+            const val = toFiniteNumber(raw);
+            if (typeof val !== 'number') {
+                return val;
+            }
+            // Some firmware variants encode temperatures as large integer values.
+            if (val > 500) {
+                return Math.round(val / 58100);
+            }
+            return val;
+        };
+
+        const extruderInfo = printData.device?.extruder?.info || [];
+        const nozzleInfo = printData.device?.nozzle?.info || [];
+
+        const buildExtruder = idx => {
+            const item = extruderInfo[idx] || {};
+            return {
+                id: item.id ?? idx,
+                temp: decodeTemp(item.temp),
+                hnow: item.hnow,
+                hpre: item.hpre,
+                htar: item.htar,
+                snow: item.snow,
+                spre: item.spre,
+                star: item.star,
+                stat: item.stat,
+                info: item.info,
+                z_bias: item.z_bias,
+            };
+        };
+
+        const buildNozzle = idx => {
+            const item = nozzleInfo[idx] || {};
+            return {
+                id: item.id ?? idx,
+                type: item.type,
+                diameter: item.diameter,
+                wear: item.wear,
+                stat: item.stat,
+                sn: item.sn,
+                tm: item.tm,
+                p_t: item.p_t,
+                fila_id: item.fila_id,
+                color_m: item.color_m,
+            };
+        };
+
+        const normalized = {
+            model: this.config.printerModel,
+            extruder: {
+                right: buildExtruder(0),
+                left: buildExtruder(1),
+                state: printData.device.extruder?.state,
+            },
+            nozzle: {
+                right: buildNozzle(0),
+                left: buildNozzle(1),
+                active_id: toFiniteNumber(printData.device.nozzle?.src_id),
+                target_id: toFiniteNumber(printData.device.nozzle?.tar_id),
+                exist: printData.device.nozzle?.exist,
+                state: printData.device.nozzle?.state,
+                hc: printData.device.nozzle?.hc,
+            },
+            chamber: {
+                temp: decodeTemp(printData.device.ctc?.info?.temp ?? printData.info?.temp ?? printData.chamber_temper),
+                state: printData.device.ctc?.state,
+            },
+            bed: {
+                temp: decodeTemp(printData.device.bed?.info?.temp ?? printData.device.bed_temp ?? printData.bed_temper),
+                state: printData.device.bed?.state,
+                target_temp: decodeTemp(printData.bed_target_temper),
+            },
+            airduct: {
+                mode_current: printData.device.airduct?.modeCur,
+                mode_function: printData.device.airduct?.modeFunc,
+                sub_function: printData.device.airduct?.subFunc,
+                sub_mode: printData.device.airduct?.subMode,
+                version: printData.device.airduct?.version,
+            },
+            filament_switch: {
+                in_0: printData.device.fila_switch?.in?.[0],
+                in_1: printData.device.fila_switch?.in?.[1],
+                out_0: printData.device.fila_switch?.out?.[0],
+                out_1: printData.device.fila_switch?.out?.[1],
+                stat: printData.device.fila_switch?.stat,
+                info: printData.device.fila_switch?.info,
+            },
+        };
+
+        // Keep an X2D-specific namespace for scripts/visualisations and a generic
+        // dual-nozzle namespace for H2D/X2D-compatible logic.
+        printData.x2d = normalized;
+        printData.dual_nozzle = normalized;
+    }
+
+
+    handleAMSUnits(message) {
+        const amsData = message.print.ams.ams;
+        // handle conversion for all AMS units
+        for (const unit in amsData) {
+            if (amsData[unit] !== null) {
+                for (const tray in amsData[unit].tray) {
+                    if (!amsData[unit].tray[tray].cols) {
+                        // amsData[unit].tray[tray] =   {
+                        // 	'bed_temp': '',
+                        // 	'bed_temp_type': '',
+                        // 	'cols': [],
+                        // 	'drying_temp': '',
+                        // 	'drying_time': '',
+                        // 	'id': '',
+                        // 	'nozzle_temp_max': '',
+                        // 	'nozzle_temp_min': '',
+                        // 	'remain': 0,
+                        // 	'tag_uid': '',
+                        // 	'tray_color': '',
+                        // 	'tray_diameter': '',
+                        // 	'tray_id_name': '',
+                        // 	'tray_info_idx': '',
+                        // 	'tray_sub_brands': '',
+                        // 	'tray_type': '',
+                        // 	'tray_uuid': '',
+                        // 	'tray_weight': '',
+                        // 	'xcam_info': ''
+                        // };
+                        // amsData[unit].tray[tray]._filamentPresent = false;
+                    } else {
+                        // amsData[unit].tray[tray]._filamentPresent = true;
+                        amsData[unit].tray[tray].bed_temp = parseInt(amsData[unit].tray[tray].bed_temp);
+                    }
+                    if (amsData[unit].tray[tray].bed_temp != null) {
+                        amsData[unit].tray[tray].bed_temp = parseInt(amsData[unit].tray[tray].bed_temp);
+                    }
+                }
+            }
+        }
+        return amsData;
+    }
+
+    publishMQTTmessages(msg) {
+        this.log.debug(`Publish message ${JSON.stringify(msg)}`);
+
+        const topic = `device/${this.config.serial}/request`;
+        client.publish(topic, JSON.stringify(msg), { qos: 0, retain: false }, error => {
+            if (error) {
+                console.error(error);
+            }
+        });
+    }
+
+    requestData() {
+        // Prepare MQTT message
+        const msg = {
+            pushing: {
+                sequence_id: '1',
+                command: 'pushall',
+            },
+            user_id: '1234567890',
+        };
+
+        // Try to request data
+        this.publishMQTTmessages(msg);
+
+        // Handle an interval only if not X1-Series
+        if (timeouts['dataPolling']) {
+            clearTimeout(timeouts['dataPolling']);
+            timeouts['dataPolling'] = null;
+        }
+        timeouts['dataPolling'] = setTimeout(() => {
+            // Request data for P1p printer series
+            if (this.config.printerModel === 'P1-Series') {
+                this.requestData();
+            }
+        }, this.config.requestInterval * 1000);
+    }
+
+    createControlStates() {
+        const controlStates = {
+            homing: {
+                name: 'Homing print head',
+                type: 'boolean',
+                role: 'button',
+                read: false,
+                write: true,
+            },
+            _customGcode: {
+                name: 'Custom G-Code',
+                type: 'string',
+                role: 'state',
+                read: true,
+                write: true,
+                def: '',
+            },
+            lightToolHeadLogo: {
+                name: 'Tool head Logo',
+                type: 'boolean',
+                role: 'state',
+                read: true,
+                write: true,
+                def: false,
+            },
+            pause: {
+                name: 'Pause printing',
+                type: 'boolean',
+                role: 'button.pause',
+                read: false,
+                write: true,
+            },
+            stop: {
+                name: 'Stop Printing',
+                type: 'boolean',
+                role: 'button.stop',
+                read: false,
+                write: true,
+            },
+            resume: {
+                name: 'Resume Printing',
+                type: 'boolean',
+                role: 'button.resume',
+                read: false,
+                write: true,
+            },
+            updateHMSErrorCodeTranslation: {
+                name: 'Update HMS error code translations',
+                type: 'boolean',
+                role: 'button',
+                read: false,
+                write: true,
+            },
+        };
+
+        const hmstates = {
+            hmsErrorCode: {
+                role: 'indicator.maintenance',
+                name: 'Health Management System (HMS)',
+                type: 'string',
+                read: true,
+                write: false,
+                def: '',
+            },
+            hmsErrorCount: {
+                role: 'indicator.maintenance',
+                name: 'HMS Alarm count',
+                type: 'number',
+                read: true,
+                write: false,
+                def: 0,
+            },
+            hmsErrors: {
+                role: 'indicator.alarm',
+                name: 'HMS Alarm ',
+                type: 'boolean',
+                read: true,
+                write: false,
+                def: false,
+            },
+        };
+
+        this.extendObject(`${this.config.serial}.control`, {
+            type: 'channel',
+            common: {
+                name: `Control device`,
+            },
+        });
+
+        for (const state in controlStates) {
+            this.extendObject(`${this.config.serial}.control.${state}`, {
+                type: 'state',
+                common: controlStates[state],
+            });
+
+            this.subscribeStates(`${this.config.serial}.control.${state}`);
+        }
+
+        for (const state in hmstates) {
+            this.extendObject(`${this.config.serial}.hms.${state}`, {
+                type: 'state',
+                common: hmstates[state],
+            });
+        }
+    }
+
+    async loadHMSErrorCodeTranslations() {
+        try {
+            this.log.info('Try to get current HMS code translations');
+
+            // Web request to download latest translations
+            const requestDeviceDataByAPI = async () => {
+                const response = await axios.get(`https://e.bambulab.com/query.php?lang=${language}`, {
+                    timeout: 3000,
+                }); // Timout of 3 seconds for API call
+                this.log.debug(JSON.stringify(`HMS ErrorCode translations : ${response.data}`));
+                return response.data;
+            };
+
+            const loadTranslationsToMemory = async tranJSON => {
+                for (const errorType in tranJSON) {
+                    for (const errorCode in tranJSON[errorType][language]) {
+                        if (
+                            tranJSON[errorType][language][errorCode] != null &&
+                            tranJSON[errorType][language][errorCode].ecode != null
+                        ) {
+                            errorCodesHMS[tranJSON[errorType][language][errorCode].ecode.toUpperCase()] = {
+                                ecode: tranJSON[errorType][language][errorCode].ecode,
+                                desc: tranJSON[errorType][language][errorCode].intro,
+                            };
+                        }
+                    }
+                }
+            };
+
+            // Try to download new translation JSON, abort function in case of error
+            const onlineTran = await requestDeviceDataByAPI();
+            if (onlineTran == null || onlineTran.data == null) {
+                this.log.warn(`Cannot download HMS error code translations`);
+                return false;
+            }
+
+            const onlineTranObj = onlineTran.data;
+            onlineTranObj.ver = onlineTran.ver;
+            onlineTranObj.language = language.toUpperCase();
+
+            // get current Translations
+            const currentTran = await this.getStateAsync('info.hmsErrorCodeTranslations');
+
+            if (currentTran == null || currentTran.val === '') {
+                this.log.info(`No Local translation available, version ${onlineTran.ver} downloaded`);
+                this.setStateAsync(`info.hmsErrorCodeTranslations`, { val: JSON.stringify(onlineTranObj), ack: true });
+                await loadTranslationsToMemory(onlineTranObj);
+            } else if (currentTran.val != null && currentTran.val !== '') {
+                const currentTranObj = JSON.parse(currentTran.val);
+                // Check if new version is available
+                if (currentTranObj.ver !== onlineTran.ver) {
+                    this.log.info(`Local translation ${currentTranObj.ver} outdated, updating to ${onlineTran.ver}`);
+                    this.setStateAsync(`info.hmsErrorCodeTranslations`, {
+                        val: JSON.stringify(onlineTranObj),
+                        ack: true,
+                    });
+                    await loadTranslationsToMemory(onlineTranObj);
+                } else if (currentTranObj.language.toUpperCase() !== language.toUpperCase()) {
+                    this.log.info(
+                        `Local translation ${currentTranObj.language} incorrect, updating to ${language.toUpperCase()}`,
+                    );
+                    this.setStateAsync(`info.hmsErrorCodeTranslations`, {
+                        val: JSON.stringify(onlineTranObj),
+                        ack: true,
+                    });
+                    loadTranslationsToMemory(onlineTranObj);
+                } else {
+                    this.log.info(`Local translation available, version ${currentTranObj.ver} is up-to-date`);
+                    loadTranslationsToMemory(currentTranObj);
+                }
+            }
+        } catch (e) {
+            if (e.code === 'ECONNABORTED' || e.message.includes('timeout')) {
+                this.log.warn(
+                    `Translation definitions not updated, cannot connect to Bambulab documentation (timeout)`,
+                );
+                this.log.debug(`[loadHMSErrorCodeTranslations] Timeout details: ${e.message}`);
+            } else if (e.code === 'ENOTFOUND' || e.code === 'ECONNREFUSED') {
+                this.log.warn(
+                    `Translation definitions not updated, cannot connect to Bambulab documentation (network error)`,
+                );
+                this.log.debug(`[loadHMSErrorCodeTranslations] Network error details: ${e.message}`);
+            } else {
+                this.log.warn(`Translation definitions not updated, error downloading from Bambulab documentation`);
+                this.log.debug(`[loadHMSErrorCodeTranslations] Error details: ${e.message} | ${e.stack}`);
+            }
+        }
+    }
+
+    /**
+     * Is called when adapter shuts down - callback has to be called under any circumstances!
+     *
+     * @param {() => void} callback - Callback function to signal shutdown completion
+     */
+    onUnload(callback) {
+        try {
+            // Close running timers
+            if (timeouts[this.config.serial]) {
+                clearTimeout(timeouts[this.config.serial]);
+                timeouts[this.config.serial] = null;
+            }
+            if (timeouts['dataPolling']) {
+                clearTimeout(timeouts['dataPolling']);
+                timeouts[timeouts['dataPolling']] = null;
+            }
+
+            if (timeouts['messageBuffer']) {
+                clearTimeout(timeouts['messageBuffer']);
+                timeouts['messageBuffer'] = null;
+            }
+
+            // Close MQTT connection if present
+            if (client) {
+                client.end();
+            }
+
+            callback();
+        } catch (e) {
+            this.log.error(`[onUnload] ${e} | ${e.stack}`);
+            callback();
+        }
+    }
+
+    /**
+     * Is called if a subscribed state changes
+     *
+     * @param {string} id - State ID that changed
+     * @param {ioBroker.State | null | undefined} state - New state value
+     */
+    /**
+     * Check if printer is currently in a state where dangerous G-code commands should be blocked
+     *
+     * @returns {boolean} True if dangerous G-code should be blocked
+     */
+    isPrintingOrActiveState() {
+        // Block dangerous commands when printer is actively working
+        // Based on stg_cur values:
+        //   -2 = Offline (safe)
+        //   -1 = Idle (safe)
+        //    0+ = Active working states (potentially dangerous)
+        return currentPrintingState != null && currentPrintingState >= 0;
+    }
+
+    /**
+     * Check if a G-code command should be blocked during printing
+     *
+     * @param {string|number} gcodeParam - The G-code command parameter
+     * @returns {boolean} True if command should be blocked
+     */
+    shouldBlockGcodeCommand(gcodeParam) {
+        if (!this.isPrintingOrActiveState()) {
+            return false; // Allow all commands when not actively working
+        }
+
+        // Convert to string and check if any blocked command is present
+        const upperParam = String(gcodeParam).toUpperCase().trim();
+        return blockedCommandsDuringPrinting.some(
+            blockedCmd =>
+                upperParam.startsWith(`${blockedCmd} `) ||
+                upperParam === blockedCmd ||
+                upperParam.startsWith(`${blockedCmd}\n`),
+        );
+    }
+
+    async onStateChange(id, state) {
+        if (state && state.val != null) {
+            // Only act on trigger if value is not Acknowledged
+            if (!state.ack) {
+                console.debug(`${id} | ${state.val}`);
+                let msg;
+                const checkID = id.split('.');
+
+                //ToDo: Implement ACK based on success message of MQTT in relation to sequence ID.
+                // Handle control states
+
+                let stateLocation = 3;
+                if (checkID[3] === 'control') {
+                    stateLocation = 4;
+                }
+
+                switch (checkID[stateLocation]) {
+                    case '_customGcode':
+                        // Check if this G-code command should be blocked during printing
+                        if (this.shouldBlockGcodeCommand(state.val)) {
+                            this.log.warn(
+                                `Blocked dangerous G-code command "${state.val}" during active printing/working state (stg_cur: ${currentPrintingState}). Command ignored for safety.`,
+                            );
+                            return; // Exit without sending the command
+                        }
+
+                        msg = msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `${state.val}`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'lightChamber':
+                        if (state.val === true) {
+                            msg = {
+                                system: {
+                                    sequence_id: '2003',
+                                    command: 'ledctrl',
+                                    led_node: 'chamber_light',
+                                    led_mode: 'on',
+                                    led_on_time: 500,
+                                    led_off_time: 500,
+                                    loop_times: 0,
+                                    interval_time: 0,
+                                },
+                                user_id: '2712364565',
+                            };
+                        } else if (state.val === false) {
+                            msg = {
+                                system: {
+                                    sequence_id: '2003',
+                                    command: 'ledctrl',
+                                    led_node: 'chamber_light',
+                                    led_mode: 'off',
+                                    led_on_time: 500,
+                                    led_off_time: 500,
+                                    loop_times: 0,
+                                    interval_time: 0,
+                                },
+                            };
+                        }
+                        break;
+                    case 'lightToolHeadLogo':
+                        if (state.val === true) {
+                            msg = msg = {
+                                print: {
+                                    command: 'gcode_line',
+                                    param: `M960 S5 P1 \n`,
+                                    sequence_id: '0',
+                                },
+                            };
+                        } else if (state.val === false) {
+                            msg = msg = {
+                                print: {
+                                    command: 'gcode_line',
+                                    param: `M960 S5 P0 \n`,
+                                    sequence_id: '0',
+                                },
+                            };
+                        }
+                        break;
+                    case 'pause':
+                        msg = {
+                            print: {
+                                sequence_id: '0',
+                                command: 'pause',
+                            },
+                        };
+                        break;
+                    case 'updateHMSErrorCodeTranslation':
+                        await this.loadHMSErrorCodeTranslations();
+                        break;
+                    case 'stop':
+                        msg = {
+                            print: {
+                                sequence_id: '0',
+                                command: 'stop',
+                            },
+                        };
+                        break;
+                    case 'resume':
+                        msg = {
+                            print: {
+                                sequence_id: '0',
+                                command: 'resume',
+                            },
+                        };
+                        break;
+                    case 'fanSpeedChamber':
+                        msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `M106 P3 S${state.val * 2.55} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+
+                        break;
+                    case 'spd_lvl':
+                        msg = {
+                            print: {
+                                command: 'print_speed',
+                                param: `${state.val} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'bed_target_temper':
+                        msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `M140 S${state.val} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'nozzle_target_temper':
+                        msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `M104 S${state.val} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'big_fan1_speed':
+                        msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `M106 P2 S${state.val * 2.55} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'big_fan2_speed':
+                        msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `M106 P3 S${state.val * 2.55} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'cooling_fan_speed':
+                        msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: `M106 P1 S${state.val * 2.55} \n`,
+                                sequence_id: '0',
+                            },
+                        };
+                        break;
+                    case 'homing':
+                        // Block homing (G28) command during active printing/working state
+                        if (this.isPrintingOrActiveState()) {
+                            this.log.warn(
+                                `Blocked homing command (G28) during active printing/working state (stg_cur: ${currentPrintingState}). Command ignored for safety.`,
+                            );
+                            return; // Exit without sending the command
+                        }
+
+                        msg = msg = {
+                            print: {
+                                command: 'gcode_line',
+                                param: 'G28 \n',
+                                reason: 'SUCCESS',
+                                result: 'SUCCESS',
+                                sequence_id: '20086',
+                                user_id: '1767420324',
+                            },
+                        };
+                        break;
+                }
+
+                if (msg) {
+                    this.publishMQTTmessages(msg);
+                }
+            }
+        } else {
+            // The state was deleted
+            this.log.info(`state ${id} deleted`);
+        }
+    }
+}
+
+if (require.main !== module) {
+    // Export the constructor in compact mode
+    /**
+     * @param {Partial<utils.AdapterOptions>} [options] - Adapter configuration options
+     */
+    module.exports = options => new Bambulab(options);
+} else {
+    // otherwise start the instance directly
+    new Bambulab();
+}
+'use strict';
+
+/*
+ * Created with @iobroker/create-adapter v2.4.0
+ */
+
+// The adapter-core module gives you access to the core ioBroker functions
+// you need to create an adapter
+const utils = require('@iobroker/adapter-core');
+
+const mqtt = require('mqtt'); // MQTT request library
+const { default: axios } = require('axios'); // Http request library
+
+const jsonExplorer = require('iobroker-jsonexplorer'); // Use jsonExplorer library
+const convert = require('./lib/converter'); // Load converter functions
+const stateAttr = require(`${__dirname}/lib/state_attr.js`); // Load attribute library
+
+let client; // Memory to store client connection information
+const clientConnection = {
+    connected: false,
+    connectError: false,
+    initiated: false,
+    reconnectMessageShown: false, // Track if we've shown the reconnection message
+    messageBuffer: false, // Track if message buffer is active
+};
+const timeouts = {}; // Object array containing all running timers
+const errorCodesHMS = {}; // Object array of translated error codes
+let language = 'en'; // System language to handle error code translations, default EN
+
+// Array of G-code commands that should be blocked during printing for safety
+const blockedCommandsDuringPrinting = ['G0', 'G1', 'G28', 'G90', 'G91'];
+let currentPrintingState = null; // Track current printing state for safety checks
+
+class Bambulab extends utils.Adapter {
+    /**
+     * @param {Partial<utils.AdapterOptions>} [options] - Adapter configuration options
+     */
+    constructor(options) {
+        super({
+            ...options,
+            name: 'bambulab',
+        });
+        this.on('ready', this.onReady.bind(this));
+        this.on('stateChange', this.onStateChange.bind(this));
+        this.on('unload', this.onUnload.bind(this));
+        jsonExplorer.init(this, stateAttr);
+    }
+
+    /**
+     * Is called when databases are connected and adapter received configuration.
+     */
+    async onReady() {
+        // Initialize your adapter here
+
+        // Get system language, use EN as fallback in case of errors
+        const sys_conf = await this.getForeignObjectAsync('system.config');
+        if (sys_conf && sys_conf.common.language) {
+            language = sys_conf.common.language;
+        }
+
+        // Reset the connection indicator during startup
+        await this.setState('info.connection', false, true);
+
+        // Download / Update HMS error Codes
+        await this.loadHMSErrorCodeTranslations();
+
+        // Handle MQTT messages
+        this.mqttMessageHandle();
+    }
+
+    /**
+     * Handle MQTT connection & message
+     */
+    mqttMessageHandle() {
+        try {
+            // Prevent multiple concurrent connection attempts
+            if (clientConnection.initiated) {
+                this.log.debug(`MQTT connection already in progress, skipping`);
+                return;
+            }
+
+            // Only log connection attempt if we haven't shown the reconnect message yet
+            if (!clientConnection.reconnectMessageShown) {
+                if (clientConnection.connectError) {
+                    this.log.info(
+                        `Attempting to reconnect to printer - will retry automatically every 30 seconds until connection is restored`,
+                    );
+                    clientConnection.reconnectMessageShown = true;
+                } else {
+                    this.log.info(`Try to connect to printer`);
+                }
+            } else {
+                this.log.debug(`Retrying connection to printer`);
+            }
+
+            clientConnection.initiated = true;
+
+            // Properly close existing client if present
+            if (client) {
+                client.removeAllListeners();
+                client.end();
+                client = null;
+            }
+
+            // Connect to Printer using MQTT
+            client = mqtt.connect(`mqtts://${this.config.host}:8883`, {
+                username: 'bblp',
+                password: this.config.Password,
+                reconnectPeriod: 30,
+                rejectUnauthorized: false,
+            });
+
+            // Establish connection to printer by MQTT
+            client.on('connect', () => {
+                if (!clientConnection.connected) {
+                    this.log.info(`Printer connected successfully`);
+                }
+                this.setState('info.connection', true, true);
+                clientConnection.connected = true;
+                clientConnection.connectError = false;
+                clientConnection.initiated = false; // Reset initiated flag on successful connection
+                clientConnection.reconnectMessageShown = false; // Reset for future disconnections
+
+                this.createControlStates();
+
+                // Subscribe on a printer topic after connection
+                client.subscribe([`device/${this.config.serial}/report`], () => {
+                    this.log.debug(`Subscribed to printer data topic by serial | ${this.config.serial}`);
+                });
+
+                // After new firmware release this summer all data must be requested 1 time at adapter start
+                this.requestData();
+            });
+
+            // Receive MQTT messages
+            client.on('message', (topic, message) => {
+                // Parse string to an JSON object
+                message = JSON.parse(message.toString());
+
+                // @ts-expect-error if print does not exist function will return false and skip
+                if (message && message.print && message && message.print.result) {
+                    // Handle values for printer statistics
+                    this.log.debug(`Printer message result ${JSON.stringify(message)}`);
+                    // @ts-expect-error if system does not exist function will return false and skip
+                } else if (message && message.print) {
+                    this.log.debug(`Printer Message ${JSON.stringify(message)}`);
+                    this.messageHandler(message);
+                    // @ts-expect-error if system does not exist function will return false and skip
+                } else if (message && message.command) {
+                    this.log.info(`Response to control command ${JSON.stringify(message)}`);
+                    // @ts-expect-error if system does not exist function will return false and skip
+                } else if (message && message.system) {
+                    // Handle values for system messages, used to acknowledge messages
+                    this.log.debug(`System Message ${JSON.stringify(message)}`);
+                } else if (message && message['t_utc']) {
+                    // Handle values for system messages, used to acknowledge messages
+                    // this.log.info(`System Message ${JSON.stringify(message)}`);
+                    // TimeStamp Message, ignore
+                } else {
+                    this.log.debug(`Unknown Message ${JSON.stringify(message)}`);
+                }
+                clientConnection.connected = true;
+                clientConnection.connectError = false;
+            });
+
+            client.on('end', () => {
+                if (clientConnection.connected) {
+                    this.log.warn(
+                        `Printer connection lost - this could be due to printer being powered off or network issues`,
+                    );
+                }
+                this.setState('info.connection', false, true);
+                clientConnection.connected = false;
+                clientConnection.connectError = true;
+                clientConnection.initiated = false;
+            });
+
+            client.on('error', error => {
+                if (!clientConnection.connectError) {
+                    this.log.error(`Connection issue occurred: ${error} - printer may be powered off or unreachable`);
+                }
+                // Close MQTT connection
+                client.end();
+                if (clientConnection.connected) {
+                    this.log.warn(
+                        `Printer connection lost - this could be due to printer being powered off or network issues`,
+                    );
+                }
+                this.setState('info.connection', false, true);
+
+                // Try to reconnect by creating a new client instead of using reconnect()
+                if (timeouts[this.config.serial]) {
+                    clearTimeout(timeouts[this.config.serial]);
+                    timeouts[this.config.serial] = null;
+                }
+                timeouts[this.config.serial] = setTimeout(() => {
+                    // Create a new MQTT connection instead of reconnecting the ended client
+                    this.mqttMessageHandle();
+                }, 30000);
+                clientConnection.connected = false;
+                clientConnection.connectError = true;
+                clientConnection.initiated = false;
+            });
+        } catch (e) {
+            this.log.error(`[MQTT Message handler] ${e} | ${e.stack}`);
+        }
+    }
+
+    /**
+     * Handle MQTT messages to ioBroker states
+     *
+     * @param {object} message - MQTT message to process
+     */
+    async messageHandler(message) {
+        try {
+            // Implement message buffer to avoid processing too many messages in a short time
+            if (clientConnection.messageBuffer === false) {
+                try {
+                    this.log.debug(`Message buffer inactive, message processing`);
+                    if (this.config.messageBuffer > 0) {
+                        clientConnection.messageBuffer = true;
+                        timeouts['messageBuffer'] = setTimeout(() => {
+                            // Request data for P1p printer series
+                            clientConnection.messageBuffer = false;
+                        }, this.config.messageBuffer * 1000);
+                    }
+                } catch (e) {
+                    this.log.error(`[MQTT Message handler] ${e}`);
+                }
+            } else {
+                this.log.debug(`Message buffer active, skipping message processing`);
+                return; // Ignore Message
+            }
+
+            if (message.print) {
+                try {
+                    this.log.debug(`Extruder R temp: ${message.print.device.extruder.info[0].temp}`);
+                } catch {
+                    // Ignore if extruder info is not available
+                }
+
+                try {
+                    this.log.debug(
+                        `Extruder R temp decoded: ${decodeExtruderTemp(message.print.device.extruder.info[0].temp)}`,
+                    );
+                } catch {
+                    // Ignore if extruder info is not available
+                }
+
+                try {
+                    this.log.debug(`Extruder L temp: ${message.print.device.extruder.info[1].temp}`);
+                } catch {
+                    // Ignore if extruder info is not available
+                }
+
+                try {
+                    this.log.debug(
+                        `Extruder L temp decoded: ${decodeExtruderTemp(message.print.device.extruder.info[1].temp)}`,
+                    );
+                } catch {
+                    // Ignore if extruder info is not available
+                }
+
+                try {
+                    this.log.debug(`Nozzel temp: ${decodeExtruderTemp(message.print.nozzle_temper)}`);
+                } catch {
+                    // Ignore if nozzle_temper is not available
+                }
+
+                function decodeExtruderTemp(raw) {
+                    if (raw > 500) {
+                        return Math.round(raw / 58100);
+                    }
+                    return raw; // Already realistic
+                }
+
+                // Modify values of JSON for states which need modification
+                message.print.control = {};
+                if (message.print.cooling_fan_speed != null) {
+                    message.print.cooling_fan_speed = convert.fanSpeed(message.print.cooling_fan_speed);
+                    message.print.control.cooling_fan_speed = message.print.cooling_fan_speed;
+                }
+                if (message.print.heatbreak_fan_speed != null) {
+                    message.print.heatbreak_fan_speed = convert.fanSpeed(message.print.heatbreak_fan_speed);
+                    message.print.control.heatbreak_fan_speed = message.print.heatbreak_fan_speed;
+                }
+
                 // Create stable, user-friendly datapoints for dual-nozzle printers (H2D/X2D).
                 // The original raw Bambu MQTT structure below print.device.* is kept untouched
                 // and will still be created by jsonExplorer as before.
