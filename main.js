@@ -284,6 +284,12 @@ class Bambulab extends utils.Adapter {
                     message.print.heatbreak_fan_speed = convert.fanSpeed(message.print.heatbreak_fan_speed);
                     message.print.control.heatbreak_fan_speed = message.print.heatbreak_fan_speed;
                 }
+
+                // Create stable, user-friendly datapoints for dual-nozzle printers (H2D/X2D).
+                // The original raw Bambu MQTT structure below print.device.* is kept untouched
+                // and will still be created by jsonExplorer as before.
+                this.normalizeDualNozzlePrinterData(message.print);
+
                 // Store original stg_cur value for printer state checking before conversion
                 const originalStgCur = message.print.stg_cur;
 
@@ -427,6 +433,136 @@ class Bambulab extends utils.Adapter {
         }
         clientConnection.initiated = true;
     }
+
+
+    /**
+     * Create stable states for newer dual-nozzle Bambu Lab printers.
+     *
+     * X2D/H2D publish the relevant data mainly below print.device.*. The raw
+     * structure is useful but not very convenient in ioBroker because arrays
+     * like extruder.info[0]/[1] are not self-explanatory. This helper mirrors
+     * the most relevant fields into print.x2d.* and print.dual_nozzle.*.
+     *
+     * No write/control commands are added here intentionally. Tool-specific
+     * nozzle and chamber-heater commands should be verified on a real printer
+     * before exposing writable states.
+     *
+     * @param {Record<string, any>} printData - The print object from MQTT
+     */
+    normalizeDualNozzlePrinterData(printData) {
+        if (!printData || !printData.device) {
+            return;
+        }
+
+        const isDualNozzleModel =
+            this.config.printerModel === 'H2D-Series' ||
+            this.config.printerModel === 'X2D-Series' ||
+            Array.isArray(printData.device?.extruder?.info) ||
+            Array.isArray(printData.device?.nozzle?.info);
+
+        if (!isDualNozzleModel) {
+            return;
+        }
+
+        const decodeTemp = raw => {
+            if (raw == null || raw === '') {
+                return raw;
+            }
+            const val = Number(raw);
+            if (!Number.isFinite(val)) {
+                return raw;
+            }
+            // Some firmware variants encode temperatures as large integer values.
+            if (val > 500) {
+                return Math.round(val / 58100);
+            }
+            return val;
+        };
+
+        const extruderInfo = printData.device?.extruder?.info || [];
+        const nozzleInfo = printData.device?.nozzle?.info || [];
+
+        const buildExtruder = idx => {
+            const item = extruderInfo[idx] || {};
+            return {
+                id: item.id ?? idx,
+                temp: decodeTemp(item.temp),
+                hnow: item.hnow,
+                hpre: item.hpre,
+                htar: item.htar,
+                snow: item.snow,
+                spre: item.spre,
+                star: item.star,
+                stat: item.stat,
+                info: item.info,
+                z_bias: item.z_bias,
+            };
+        };
+
+        const buildNozzle = idx => {
+            const item = nozzleInfo[idx] || {};
+            return {
+                id: item.id ?? idx,
+                type: item.type,
+                diameter: item.diameter,
+                wear: item.wear,
+                stat: item.stat,
+                sn: item.sn,
+                tm: item.tm,
+                p_t: item.p_t,
+                fila_id: item.fila_id,
+                color_m: item.color_m,
+            };
+        };
+
+        const normalized = {
+            model: this.config.printerModel,
+            extruder: {
+                right: buildExtruder(0),
+                left: buildExtruder(1),
+                state: printData.device.extruder?.state,
+            },
+            nozzle: {
+                right: buildNozzle(0),
+                left: buildNozzle(1),
+                active_id: printData.device.nozzle?.src_id,
+                target_id: printData.device.nozzle?.tar_id,
+                exist: printData.device.nozzle?.exist,
+                state: printData.device.nozzle?.state,
+                hc: printData.device.nozzle?.hc,
+            },
+            chamber: {
+                temp: decodeTemp(printData.device.ctc?.info?.temp ?? printData.info?.temp ?? printData.chamber_temper),
+                state: printData.device.ctc?.state,
+            },
+            bed: {
+                temp: decodeTemp(printData.device.bed?.info?.temp ?? printData.device.bed_temp ?? printData.bed_temper),
+                state: printData.device.bed?.state,
+                target_temp: decodeTemp(printData.bed_target_temper),
+            },
+            airduct: {
+                mode_current: printData.device.airduct?.modeCur,
+                mode_function: printData.device.airduct?.modeFunc,
+                sub_function: printData.device.airduct?.subFunc,
+                sub_mode: printData.device.airduct?.subMode,
+                version: printData.device.airduct?.version,
+            },
+            filament_switch: {
+                in_0: printData.device.fila_switch?.in?.[0],
+                in_1: printData.device.fila_switch?.in?.[1],
+                out_0: printData.device.fila_switch?.out?.[0],
+                out_1: printData.device.fila_switch?.out?.[1],
+                stat: printData.device.fila_switch?.stat,
+                info: printData.device.fila_switch?.info,
+            },
+        };
+
+        // Keep an X2D-specific namespace for scripts/visualisations and a generic
+        // dual-nozzle namespace for H2D/X2D-compatible logic.
+        printData.x2d = normalized;
+        printData.dual_nozzle = normalized;
+    }
+
 
     handleAMSUnits(message) {
         const amsData = message.print.ams.ams;
