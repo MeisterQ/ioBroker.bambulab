@@ -297,6 +297,13 @@ class Bambulab extends utils.Adapter {
                 // created by jsonExplorer, but known type conflicts are normalized above.
                 this.normalizeDualNozzlePrinterData(message.print);
 
+                // Write the most important dual-nozzle states explicitly.
+                // jsonExplorer creates many raw states automatically, but on some ioBroker
+                // installations nested arrays/objects below print.x2d.* are not created
+                // reliably before the first write. Explicit states make the X2D/H2D
+                // temperatures available immediately and with stable types.
+                await this.updateDualNozzlePrinterStates(message.print);
+
                 // Store original stg_cur value for printer state checking before conversion
                 const originalStgCur = message.print.stg_cur;
 
@@ -625,6 +632,77 @@ class Bambulab extends utils.Adapter {
         // dual-nozzle namespace for H2D/X2D-compatible logic.
         printData.x2d = normalized;
         printData.dual_nozzle = normalized;
+    }
+
+    /**
+     * Explicitly create and update stable dual-nozzle states.
+     * This complements jsonExplorer and avoids missing temperature values on X2D/H2D.
+     *
+     * @param {object} printData - Bambu print payload
+     */
+    async updateDualNozzlePrinterStates(printData) {
+        if (!printData?.x2d) {
+            return;
+        }
+
+        const root = `${this.config.serial}`;
+
+        const ensureState = async (id, name, type, role, unit = undefined, write = false) => {
+            const common = {
+                name,
+                type,
+                role,
+                read: true,
+                write,
+            };
+            if (unit !== undefined) {
+                common.unit = unit;
+            }
+            await this.setObjectNotExistsAsync(`${root}.${id}`, {
+                type: 'state',
+                common,
+                native: {},
+            });
+        };
+
+        const setVal = async (id, val) => {
+            if (val === undefined || val === null || Number.isNaN(val)) {
+                return;
+            }
+            await this.setStateAsync(`${root}.${id}`, { val, ack: true });
+        };
+
+        const states = [
+            ['x2d.extruder.right.temp', 'X2D right extruder temperature', 'number', 'value.temperature', '°C', printData.x2d.extruder?.right?.temp],
+            ['x2d.extruder.left.temp', 'X2D left extruder temperature', 'number', 'value.temperature', '°C', printData.x2d.extruder?.left?.temp],
+            ['dual_nozzle.extruder.right.temp', 'Dual nozzle right extruder temperature', 'number', 'value.temperature', '°C', printData.x2d.extruder?.right?.temp],
+            ['dual_nozzle.extruder.left.temp', 'Dual nozzle left extruder temperature', 'number', 'value.temperature', '°C', printData.x2d.extruder?.left?.temp],
+
+            ['x2d.extruder.right.id', 'X2D right extruder id', 'number', 'value', undefined, printData.x2d.extruder?.right?.id],
+            ['x2d.extruder.left.id', 'X2D left extruder id', 'number', 'value', undefined, printData.x2d.extruder?.left?.id],
+            ['x2d.extruder.state', 'X2D extruder state', 'number', 'value', undefined, printData.x2d.extruder?.state],
+
+            ['x2d.nozzle.right.type', 'X2D right nozzle type', 'string', 'text', undefined, printData.x2d.nozzle?.right?.type],
+            ['x2d.nozzle.left.type', 'X2D left nozzle type', 'string', 'text', undefined, printData.x2d.nozzle?.left?.type],
+            ['x2d.nozzle.right.diameter', 'X2D right nozzle diameter', 'number', 'value', 'mm', printData.x2d.nozzle?.right?.diameter],
+            ['x2d.nozzle.left.diameter', 'X2D left nozzle diameter', 'number', 'value', 'mm', printData.x2d.nozzle?.left?.diameter],
+            ['x2d.nozzle.active_id', 'X2D active nozzle id', 'number', 'value', undefined, printData.x2d.nozzle?.active_id],
+            ['x2d.nozzle.target_id', 'X2D target nozzle id', 'number', 'value', undefined, printData.x2d.nozzle?.target_id],
+
+            ['dual_nozzle.nozzle.active_id', 'Dual nozzle active id', 'number', 'value', undefined, printData.x2d.nozzle?.active_id],
+            ['dual_nozzle.nozzle.target_id', 'Dual nozzle target id', 'number', 'value', undefined, printData.x2d.nozzle?.target_id],
+
+            ['x2d.chamber.temp', 'X2D chamber temperature', 'number', 'value.temperature', '°C', printData.x2d.chamber?.temp],
+            ['x2d.chamber.state', 'X2D chamber state', 'number', 'value', undefined, printData.x2d.chamber?.state],
+            ['x2d.bed.temp', 'X2D bed temperature', 'number', 'value.temperature', '°C', printData.x2d.bed?.temp],
+            ['x2d.bed.target_temp', 'X2D bed target temperature', 'number', 'value.temperature', '°C', printData.x2d.bed?.target_temp],
+            ['x2d.bed.state', 'X2D bed state', 'number', 'value', undefined, printData.x2d.bed?.state],
+        ];
+
+        for (const [id, name, type, role, unit, value] of states) {
+            await ensureState(id, name, type, role, unit);
+            await setVal(id, value);
+        }
     }
 
 
